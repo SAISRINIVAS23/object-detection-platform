@@ -1,51 +1,58 @@
-from fastapi import APIRouter, Depends
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, Depends, HTTPException, status
 from collections import Counter
 from datetime import datetime
 
-from app.database.deps import get_db, get_current_user
-from app.models.detection import Detection
-from app.models.user import User
+from app.database.deps import supabase, get_current_user
 
 router = APIRouter()
 
 @router.get("/stats")
 def stats(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user)
 ):
-    # Fetch all user detections
-    user_detections = (
-        db.query(Detection)
-        .filter(Detection.user_id == current_user.id)
-        .order_by(Detection.created_at.desc())
-        .all()
-    )
+    try:
+        response = (
+            supabase.table("detections")
+            .select("*")
+            .eq("user_id", current_user["id"])
+            .order("created_at", desc=True)
+            .execute()
+        )
+        user_detections = response.data
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database query error: {str(e)}"
+        )
 
     total_uploads = len(user_detections)
     total_items_detected = 0
     object_counter = Counter()
     unique_dates = set()
 
-    # Detailed counts matching the dashboard cards
     images_processed = 0
     videos_processed = 0
     screenshots_saved = 0
 
     for d in user_detections:
-        dets = d.detections or []
+        dets = d.get("detections") or []
         total_items_detected += len(dets)
         for item in dets:
             obj_name = item.get("object", "unknown")
             object_counter[obj_name] += 1
         
         # Track unique days
-        if d.created_at:
-            unique_dates.add(d.created_at.date())
+        created_at_str = d.get("created_at")
+        if created_at_str:
+            try:
+                dt = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
+                unique_dates.add(dt.date())
+            except Exception:
+                pass
 
         # Classify the detection type
-        img_name = d.image_name or ""
-        proc_img = d.processed_image or ""
+        img_name = d.get("image_name") or ""
+        proc_img = d.get("processed_image") or ""
 
         if img_name.startswith("webcam_"):
             screenshots_saved += 1
@@ -57,12 +64,17 @@ def stats(
     # Format recent activity (last 5 detections)
     recent_activity = []
     for d in user_detections[:5]:
+        filename = d.get("image_name")
+        proc_img_path = d.get("processed_image")
+        
+        # Build cloud public URL redirect endpoint to fetch from Supabase
+        # We redirect users through backend proxy/redirect URL so the frontend stays clean
         recent_activity.append({
-            "id": d.id,
-            "image_name": d.image_name,
-            "processed_image": f"http://127.0.0.1:8000{d.processed_image}" if d.processed_image else None,
-            "detections": d.detections,
-            "created_at": d.created_at.isoformat() if d.created_at else None
+            "id": d.get("id"),
+            "image_name": filename,
+            "processed_image": f"http://127.0.0.1:8000{proc_img_path}" if proc_img_path else None,
+            "detections": dets,
+            "created_at": created_at_str
         })
 
     return {

@@ -47,13 +47,27 @@ def detect_video(video_path, output_path, conf=0.25):
     if not cap.isOpened():
         raise ValueError("Could not open video file")
 
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    original_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    original_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 25
 
-    # Define standard mp4 codec writer
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    # Downscale video frames to max 640px to optimize YOLO inference speed and upload file size
+    max_dim = 640
+    if max(original_width, original_height) > max_dim:
+        scale = max_dim / max(original_width, original_height)
+        width = int(original_width * scale)
+        height = int(original_height * scale)
+    else:
+        width = original_width
+        height = original_height
+
+    # Attempt to open VideoWriter using web-friendly H.264 (avc1) codec, with fallback to mp4v
+    fourcc = cv2.VideoWriter_fourcc(*'avc1')
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    if not out.isOpened():
+        print("avc1 codec not supported/opened, falling back to mp4v codec")
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
     detections_list = []
 
@@ -62,7 +76,13 @@ def detect_video(video_path, output_path, conf=0.25):
         if not ret:
             break
 
-        results = model(frame, conf=conf)
+        # Resize the frame if it was downscaled
+        if original_width != width or original_height != height:
+            frame_resized = cv2.resize(frame, (width, height))
+        else:
+            frame_resized = frame
+
+        results = model(frame_resized, conf=conf)
         annotated_frame = results[0].plot()
         out.write(annotated_frame)
 

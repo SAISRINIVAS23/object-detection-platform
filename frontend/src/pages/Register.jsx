@@ -46,13 +46,11 @@ function Register() {
             }, 2000);
 
         } catch (err) {
-
             if (err.response) {
-                setError(err.response.data.error || "Registration Failed");
+                setError(err.response.data.detail || err.response.data.error || "Registration Failed");
             } else {
                 setError("Server not reachable");
             }
-
         }
 
         setLoading(false);

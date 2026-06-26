@@ -1,147 +1,142 @@
 import os
 import uuid
 import base64
+import cv2
+import numpy as np
 from datetime import datetime
 from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, status, Query
-from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
 from app.ai.detector import detect_image, detect_video, detect_frame
-from app.database.deps import get_db, get_current_user
-from app.models.detection import Detection
-from app.models.user import User
+from app.database.deps import supabase, get_current_user
 
 router = APIRouter()
 
-UPLOAD_IMG_DIR = "app/uploads/images"
-PROCESSED_IMG_DIR = "app/processed/images"
-UPLOAD_VID_DIR = "app/uploads/videos"
-PROCESSED_VID_DIR = "app/processed/videos"
+BUCKET_NAME = "gallery"
 
 class FrameRequest(BaseModel):
     frame: str  # Base64 data string (JPEG)
     conf: float = 0.25
 
+# DEFINED AS Synchronous 'def' to run in FastAPI's external thread pool.
+# This prevents CPU-bound YOLO processing from blocking the main event loop.
 @router.post("/image")
-async def detect_image_api(
+def detect_image_api(
     file: UploadFile = File(...),
     conf: float = Query(0.25, ge=0.1, le=1.0),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user)
 ):
-    os.makedirs(UPLOAD_IMG_DIR, exist_ok=True)
-    os.makedirs(PROCESSED_IMG_DIR, exist_ok=True)
-
-    extension = os.path.splitext(file.filename)[1]
-    filename = (
-        datetime.now().strftime("%Y%m%d_%H%M%S_")
-        + str(uuid.uuid4())[:8]
-        + extension
-    )
-
-    upload_path = os.path.join(UPLOAD_IMG_DIR, filename)
-    processed_path = os.path.join(PROCESSED_IMG_DIR, filename)
-
     try:
-        content = await file.read()
-        with open(upload_path, "wb") as buffer:
-            buffer.write(content)
+        # Use synchronous file.file.read() instead of async await
+        content = file.file.read()
+        nparr = np.frombuffer(content, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid image file uploaded."
+            )
+            
+        results = detect_image_in_memory(img, conf=conf)
+        detections = results["detections"]
+        processed_bytes = results["processed_bytes"]
+
+        extension = os.path.splitext(file.filename)[1] or ".jpg"
+        filename = f"image_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}{extension}"
+        
+        supabase.storage.from_(BUCKET_NAME).upload(
+            path=f"processed/images/{filename}",
+            file=processed_bytes,
+            file_options={"content-type": "image/jpeg"}
+        )
+
+        db_detection = {
+            "user_id": current_user["id"],
+            "image_name": filename,
+            "processed_image": f"/processed/images/{filename}",
+            "detections": detections
+        }
+        supabase.table("detections").insert(db_detection).execute()
+
+        public_url = supabase.storage.from_(BUCKET_NAME).get_public_url(f"processed/images/{filename}")
+
+        return {
+            "success": True,
+            "message": "Detection completed and saved to cloud",
+            "filename": filename,
+            "processed_image": public_url,
+            "detections": detections
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Could not save uploaded image: {str(e)}"
+            detail=f"Image detection/upload failed: {str(e)}"
         )
 
-    try:
-        detections = detect_image(upload_path, processed_path, conf=conf)
-    except Exception as e:
-        if os.path.exists(upload_path):
-            os.remove(upload_path)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error running object detection: {str(e)}"
-        )
-
-    db_detection = Detection(
-        user_id=current_user.id,
-        image_name=filename,
-        processed_image=f"/processed/images/{filename}",
-        detections=detections
-    )
-    db.add(db_detection)
-    db.commit()
-    db.refresh(db_detection)
-
-    return {
-        "success": True,
-        "message": "Detection completed",
-        "filename": filename,
-        "processed_image": f"http://127.0.0.1:8000/processed/images/{filename}",
-        "detections": detections
-    }
-
+# DEFINED AS Synchronous 'def' to run in FastAPI's external thread pool.
+# This prevents the server from freezing/buffering during heavy video analysis.
 @router.post("/video")
-async def detect_video_api(
+def detect_video_api(
     file: UploadFile = File(...),
     conf: float = Query(0.25, ge=0.1, le=1.0),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user)
 ):
-    os.makedirs(UPLOAD_VID_DIR, exist_ok=True)
-    os.makedirs(PROCESSED_VID_DIR, exist_ok=True)
+    extension = os.path.splitext(file.filename)[1] or ".mp4"
+    filename = f"video_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}{extension}"
 
-    extension = os.path.splitext(file.filename)[1]
-    filename = (
-        datetime.now().strftime("%Y%m%d_%H%M%S_")
-        + str(uuid.uuid4())[:8]
-        + extension
-    )
-
-    upload_path = os.path.join(UPLOAD_VID_DIR, filename)
-    processed_path = os.path.join(PROCESSED_VID_DIR, filename)
+    temp_in_path = f"temp_in_{uuid.uuid4().hex}{extension}"
+    temp_out_path = f"temp_out_{uuid.uuid4().hex}{extension}"
 
     try:
-        content = await file.read()
-        with open(upload_path, "wb") as buffer:
+        content = file.file.read()
+        with open(temp_in_path, "wb") as buffer:
             buffer.write(content)
+
+        detections = detect_video(temp_in_path, temp_out_path, conf=conf)
+
+        with open(temp_out_path, "rb") as f:
+            video_bytes = f.read()
+
+        supabase.storage.from_(BUCKET_NAME).upload(
+            path=f"processed/videos/{filename}",
+            file=video_bytes,
+            file_options={"content-type": "video/mp4"}
+        )
+
+        db_detection = {
+            "user_id": current_user["id"],
+            "image_name": filename,
+            "processed_image": f"/processed/videos/{filename}",
+            "detections": detections
+        }
+        supabase.table("detections").insert(db_detection).execute()
+
+        public_url = supabase.storage.from_(BUCKET_NAME).get_public_url(f"processed/videos/{filename}")
+
+        return {
+            "success": True,
+            "message": "Video processed and saved to cloud",
+            "filename": filename,
+            "processed_video": public_url,
+            "detections": detections
+        }
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Could not save uploaded video: {str(e)}"
+            detail=f"Video processing/upload failed: {str(e)}"
         )
-
-    try:
-        detections = detect_video(upload_path, processed_path, conf=conf)
-    except Exception as e:
-        if os.path.exists(upload_path):
-            os.remove(upload_path)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error running object detection on video: {str(e)}"
-        )
-
-    db_detection = Detection(
-        user_id=current_user.id,
-        image_name=filename,
-        processed_image=f"/processed/videos/{filename}",
-        detections=detections
-    )
-    db.add(db_detection)
-    db.commit()
-    db.refresh(db_detection)
-
-    return {
-        "success": True,
-        "message": "Video detection completed",
-        "filename": filename,
-        "processed_video": f"http://127.0.0.1:8000/processed/videos/{filename}",
-        "detections": detections
-    }
+    finally:
+        if os.path.exists(temp_in_path):
+            os.remove(temp_in_path)
+        if os.path.exists(temp_out_path):
+            os.remove(temp_out_path)
 
 @router.post("/frame")
 def detect_frame_api(
     request: FrameRequest,
-    current_user: User = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user)
 ):
     try:
         header, encoded = request.frame.split(",", 1)
@@ -173,12 +168,8 @@ def detect_frame_api(
 @router.post("/webcam")
 def detect_webcam_save_api(
     request: FrameRequest,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user)
 ):
-    os.makedirs(UPLOAD_IMG_DIR, exist_ok=True)
-    os.makedirs(PROCESSED_IMG_DIR, exist_ok=True)
-
     try:
         header, encoded = request.frame.split(",", 1)
     except ValueError:
@@ -192,45 +183,71 @@ def detect_webcam_save_api(
             detail=f"Invalid base64 encoding: {str(e)}"
         )
 
-    # Generate filename with webcam prefix
-    filename = f"webcam_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{str(uuid.uuid4())[:8]}.jpg"
-    upload_path = os.path.join(UPLOAD_IMG_DIR, filename)
-    processed_path = os.path.join(PROCESSED_IMG_DIR, filename)
+    filename = f"webcam_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}.jpg"
 
     try:
-        # Save raw frame
-        with open(upload_path, "wb") as buffer:
-            buffer.write(image_bytes)
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid frame image"
+            )
+
+        results = detect_image_in_memory(img, conf=request.conf)
+        detections = results["detections"]
+        processed_bytes = results["processed_bytes"]
+
+        supabase.storage.from_(BUCKET_NAME).upload(
+            path=f"processed/images/{filename}",
+            file=processed_bytes,
+            file_options={"content-type": "image/jpeg"}
+        )
+
+        db_detection = {
+            "user_id": current_user["id"],
+            "image_name": filename,
+            "processed_image": f"/processed/images/{filename}",
+            "detections": detections
+        }
+        supabase.table("detections").insert(db_detection).execute()
+
+        public_url = supabase.storage.from_(BUCKET_NAME).get_public_url(f"processed/images/{filename}")
+
+        return {
+            "success": True,
+            "message": "Webcam frame saved to cloud",
+            "filename": filename,
+            "processed_image": public_url,
+            "detections": detections
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Could not save webcam frame: {str(e)}"
+            detail=f"Webcam capture upload failed: {str(e)}"
         )
 
-    try:
-        detections = detect_image(upload_path, processed_path, conf=request.conf)
-    except Exception as e:
-        if os.path.exists(upload_path):
-            os.remove(upload_path)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error analyzing webcam frame: {str(e)}"
-        )
+def detect_image_in_memory(img_array, conf=0.25):
+    from app.ai.yolo_model import model
+    results = model(img_array, conf=conf)
+    annotated = results[0].plot()
 
-    db_detection = Detection(
-        user_id=current_user.id,
-        image_name=filename,
-        processed_image=f"/processed/images/{filename}",
-        detections=detections
-    )
-    db.add(db_detection)
-    db.commit()
-    db.refresh(db_detection)
+    _, buffer = cv2.imencode(".jpg", annotated)
+    processed_bytes = buffer.tobytes()
 
+    detections = []
+    for box in results[0].boxes:
+        class_id = int(box.cls[0])
+        class_name = model.names[class_id]
+        confidence = float(box.conf[0])
+        detections.append({
+            "object": class_name,
+            "confidence": round(confidence, 2)
+        })
+        
     return {
-        "success": True,
-        "message": "Webcam frame saved successfully",
-        "filename": filename,
-        "processed_image": f"http://127.0.0.1:8000/processed/images/{filename}",
-        "detections": detections
+        "detections": detections,
+        "processed_bytes": processed_bytes
     }

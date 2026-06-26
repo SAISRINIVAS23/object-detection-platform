@@ -61,7 +61,7 @@ function Login() {
                         </h2>
 
                         <p className="text-muted">
-                            TensorFlow + FastAPI + React
+                            YOLO11 + FastAPI + React + Supabase
                         </p>
 
                     </div>
