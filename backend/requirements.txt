@@ -38,7 +38,7 @@ namex==0.1.0
 networkx==3.6.1
 numpy==2.5.0
 nvidia-ml-py==13.610.43
-opencv-python==4.13.0.92
+opencv-python-headless==4.13.0.92
 opt_einsum==3.4.0
 optree==0.19.1
 packaging==26.2
