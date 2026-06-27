@@ -25,7 +25,7 @@ def detect_frame(image_bytes, conf=0.25):
     if img is None:
         raise ValueError("Invalid frame image")
 
-    results = model(img, conf=conf)
+    results = model(img, conf=conf, imgsz=320)
     annotated = results[0].plot()
 
     _, buffer = cv2.imencode(".jpg", annotated)
@@ -82,7 +82,7 @@ def detect_video(video_path, output_path, conf=0.25):
         else:
             frame_resized = frame
 
-        results = model(frame_resized, conf=conf)
+        results = model(frame_resized, conf=conf, imgsz=320)
         annotated_frame = results[0].plot()
         out.write(annotated_frame)
 

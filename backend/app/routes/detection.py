@@ -231,7 +231,7 @@ def detect_webcam_save_api(
 
 def detect_image_in_memory(img_array, conf=0.25):
     from app.ai.yolo_model import model
-    results = model(img_array, conf=conf)
+    results = model(img_array, conf=conf, imgsz=320)
     annotated = results[0].plot()
 
     _, buffer = cv2.imencode(".jpg", annotated)
