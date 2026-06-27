@@ -1,9 +1,10 @@
 import cv2
 import numpy as np
 import base64
-from app.ai.yolo_model import model
+from app.ai.yolo_model import get_yolo_model
 
 def detect_image(image_path, output_path, conf=0.25):
+    model = get_yolo_model()
     results = model(image_path, conf=conf)
     annotated = results[0].plot()
     cv2.imwrite(output_path, annotated)
@@ -20,6 +21,7 @@ def detect_image(image_path, output_path, conf=0.25):
     return detections
 
 def detect_frame(image_bytes, conf=0.25):
+    model = get_yolo_model()
     nparr = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if img is None:
@@ -43,6 +45,7 @@ def detect_frame(image_bytes, conf=0.25):
     return detections, annotated_base64
 
 def detect_video(video_path, output_path, conf=0.25):
+    model = get_yolo_model()
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise ValueError("Could not open video file")
