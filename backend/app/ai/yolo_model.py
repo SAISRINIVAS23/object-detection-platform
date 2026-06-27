@@ -1,3 +1,5 @@
+import torch
+torch.set_num_threads(1)
 from ultralytics import YOLO
 
 print("Loading YOLO11 model...")
